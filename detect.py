@@ -35,6 +35,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -310,6 +311,7 @@ def run(
     else:
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
+    vid_fps, vid_emit_next = [0.0] * bs, [None] * bs
 
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
@@ -429,13 +431,17 @@ def run(
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
                         release_writer(vid_writer[i])  # release previous video/HLS writer
-                        if hls_fps > 0:
-                            fps = hls_fps
+                        source_fps = resolve_video_fps(vid_cap, dataset, i, vid_stride)
+                        if webcam:
+                            processing_fps = estimate_processing_fps(dt)
+                            if hls_fps > 0:
+                                # For live streams, treat --hls-fps as a ceiling, not a fixed rate.
+                                # This avoids slow-motion when inference cannot sustain the requested fps.
+                                fps = min(hls_fps, source_fps, processing_fps)
+                            else:
+                                fps = min(source_fps, processing_fps)
                         else:
-                            fps = resolve_video_fps(vid_cap, dataset, i, vid_stride)
-                            if webcam:
-                                # For live streams, don't stamp output faster than the processing loop can sustain.
-                                fps = min(fps, estimate_processing_fps(dt))
+                            fps = hls_fps if hls_fps > 0 else source_fps
                         if vid_cap:  # video
                             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or im0.shape[1]
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or im0.shape[0]
@@ -457,6 +463,18 @@ def run(
                         else:
                             save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
                             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                        vid_fps[i] = fps
+                        vid_emit_next[i] = None
+                    if save_hls and webcam and hls_fps > 0:
+                        interval = 1.0 / max(vid_fps[i], 1.0)
+                        now = time.perf_counter()
+                        next_emit = vid_emit_next[i]
+                        if next_emit is not None and now < next_emit:
+                            continue
+                        if next_emit is None or now - next_emit > 2 * interval:
+                            vid_emit_next[i] = now + interval
+                        else:
+                            vid_emit_next[i] = next_emit + interval
                     vid_writer[i].write(im0)
 
         # Print time (inference-only)
