@@ -440,6 +440,7 @@ class LoadStreams:
         n = len(sources)
         self.sources = [clean_str(x) for x in sources]  # clean source names for later
         self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
+        self.shapes = [(0, 0)] * n  # (h, w) per source for safe fallback frames
         for i, s in enumerate(sources):  # index, source
             # Start thread to read frames from video stream
             st = f"{i + 1}/{n}: {s}... "
@@ -457,11 +458,25 @@ class LoadStreams:
             assert cap.isOpened(), f"{st}Failed to open {s}"
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.shapes[i] = (h, w)
             fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
             self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")  # infinite stream fallback
             self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
 
-            _, self.imgs[i] = cap.read()  # guarantee first frame
+            # Read an initial frame with retries; some RTSP cameras return empty frames at startup.
+            success, im = cap.read()
+            for _ in range(29):
+                if success and im is not None:
+                    break
+                time.sleep(0.05)
+                success, im = cap.read()
+            if not success or im is None:
+                LOGGER.warning(f"WARNING ⚠️ {st} received no initial frame, using fallback frame until stream recovers.")
+                fh, fw = self.shapes[i]
+                fh = fh if fh > 0 else 640
+                fw = fw if fw > 0 else 640
+                im = np.zeros((fh, fw, 3), dtype=np.uint8)
+            self.imgs[i] = im
             self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
             LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
             self.threads[i].start()
@@ -487,7 +502,13 @@ class LoadStreams:
                     self.imgs[i] = im
                 else:
                     LOGGER.warning("WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.")
-                    self.imgs[i] = np.zeros_like(self.imgs[i])
+                    if self.imgs[i] is not None:
+                        self.imgs[i] = np.zeros_like(self.imgs[i])
+                    else:
+                        h, w = self.shapes[i]
+                        h = h if h > 0 else 640
+                        w = w if w > 0 else 640
+                        self.imgs[i] = np.zeros((h, w, 3), dtype=np.uint8)
                     cap.open(stream)  # re-open stream if signal was lost
             time.sleep(0.0)  # wait time
 
@@ -506,6 +527,12 @@ class LoadStreams:
             raise StopIteration
 
         im0 = self.imgs.copy()
+        for i, x in enumerate(im0):
+            if x is None:
+                h, w = self.shapes[i]
+                h = h if h > 0 else 640
+                w = w if w > 0 else 640
+                im0[i] = np.zeros((h, w, 3), dtype=np.uint8)
         if self.transforms:
             im = np.stack([self.transforms(x) for x in im0])  # transforms
         else:
