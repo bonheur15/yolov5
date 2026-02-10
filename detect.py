@@ -32,6 +32,8 @@ import argparse
 import csv
 import os
 import platform
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +68,131 @@ from utils.general import (
 from utils.torch_utils import select_device, smart_inference_mode
 
 
+def resolve_video_fps(vid_cap, dataset, stream_index, vid_stride, fallback=30.0):
+    """Resolve output FPS for saved video/HLS, handling stream sources and stride."""
+    fps = 0.0
+    if vid_cap:
+        fps = vid_cap.get(cv2.CAP_PROP_FPS) or 0.0
+    elif hasattr(dataset, "fps"):
+        fps = float(dataset.fps[stream_index]) if stream_index < len(dataset.fps) else 0.0
+    if not fps or fps != fps or fps <= 0:  # includes NaN
+        fps = float(fallback)
+    fps = fps / max(int(vid_stride), 1)
+    return max(fps, 1.0)
+
+
+def estimate_processing_fps(dt):
+    """Estimate current processing FPS from preprocessing + inference + NMS timing."""
+    frame_time = sum(stage.dt for stage in dt)
+    return 1.0 / max(frame_time, 1e-6)
+
+
+def release_writer(writer):
+    """Release any writer object that exposes a release() method."""
+    if writer is not None and hasattr(writer, "release"):
+        writer.release()
+
+
+class FFmpegHLSWriter:
+    """Write BGR frames to an HLS playlist via ffmpeg stdin."""
+
+    def __init__(
+        self,
+        playlist_path,
+        width,
+        height,
+        fps,
+        hls_time=2.0,
+        hls_list_size=6,
+        hls_delete_threshold=2,
+        hls_segment_type="ts",
+    ):
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None:
+            raise FileNotFoundError("ffmpeg was not found in PATH; install ffmpeg to use --save-hls")
+
+        playlist_path = Path(playlist_path)
+        playlist_path.parent.mkdir(parents=True, exist_ok=True)
+        stem = playlist_path.stem
+        segment_ext = "m4s" if hls_segment_type == "fmp4" else "ts"
+        segment_pattern = str(playlist_path.parent / f"{stem}_%06d.{segment_ext}")
+
+        gop = max(int(round(fps * hls_time)), 1)
+        hls_flags = "append_list+delete_segments+independent_segments+omit_endlist"
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-g",
+            str(gop),
+            "-keyint_min",
+            str(gop),
+            "-sc_threshold",
+            "0",
+            "-flags",
+            "+cgop",
+            "-fps_mode",
+            "cfr",
+            "-f",
+            "hls",
+            "-hls_time",
+            str(hls_time),
+            "-hls_list_size",
+            str(hls_list_size),
+            "-hls_delete_threshold",
+            str(hls_delete_threshold),
+            "-hls_flags",
+            hls_flags,
+            "-hls_segment_filename",
+            segment_pattern,
+        ]
+        if hls_segment_type == "fmp4":
+            cmd += ["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", f"{stem}_init.mp4"]
+        cmd += [str(playlist_path)]
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def write(self, frame):
+        if self.process.poll() is not None:
+            err = self.process.stderr.read().decode(errors="ignore").strip()
+            raise RuntimeError(f"ffmpeg exited before write: {err}")
+        self.process.stdin.write(frame.tobytes())
+
+    def release(self):
+        if self.process.stdin and not self.process.stdin.closed:
+            self.process.stdin.close()
+        self.process.wait(timeout=10)
+        if self.process.returncode != 0:
+            err = self.process.stderr.read().decode(errors="ignore").strip()
+            LOGGER.warning(f"HLS writer exited with code {self.process.returncode}: {err}")
+
+
 @smart_inference_mode()
 def run(
     weights=ROOT / "yolov5s.pt",  # model path or triton URL
@@ -97,6 +224,12 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    save_hls=False,  # save video/stream outputs as HLS playlist + segments
+    hls_time=2.0,  # HLS segment duration in seconds
+    hls_list_size=6,  # number of segments kept in playlist
+    hls_delete_threshold=2,  # extra stale segments kept on disk before deletion
+    hls_segment_type="ts",  # HLS segment type: ts or fmp4
+    hls_fps=0.0,  # force output FPS for HLS/video writers (0 = auto)
 ):
     """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
@@ -295,16 +428,35 @@ def run(
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
-                        if isinstance(vid_writer[i], cv2.VideoWriter):
-                            vid_writer[i].release()  # release previous video writer
+                        release_writer(vid_writer[i])  # release previous video/HLS writer
+                        if hls_fps > 0:
+                            fps = hls_fps
+                        else:
+                            fps = resolve_video_fps(vid_cap, dataset, i, vid_stride)
+                            if webcam:
+                                # For live streams, don't stamp output faster than the processing loop can sustain.
+                                fps = min(fps, estimate_processing_fps(dt))
                         if vid_cap:  # video
-                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or im0.shape[1]
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or im0.shape[0]
                         else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                            w, h = im0.shape[1], im0.shape[0]
+
+                        if save_hls:
+                            save_path = str(Path(save_path).with_suffix(".m3u8"))
+                            vid_writer[i] = FFmpegHLSWriter(
+                                save_path,
+                                width=w,
+                                height=h,
+                                fps=fps,
+                                hls_time=hls_time,
+                                hls_list_size=hls_list_size,
+                                hls_delete_threshold=hls_delete_threshold,
+                                hls_segment_type=hls_segment_type,
+                            )
+                        else:
+                            save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
+                            vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                     vid_writer[i].write(im0)
 
         # Print time (inference-only)
@@ -316,6 +468,8 @@ def run(
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    for writer in vid_writer:
+        release_writer(writer)
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
@@ -399,6 +553,28 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--save-hls", action="store_true", help="save stream/video outputs as HLS (m3u8 + segments)")
+    parser.add_argument("--hls-time", type=float, default=2.0, help="HLS segment duration in seconds")
+    parser.add_argument("--hls-list-size", type=int, default=6, help="max segments kept in HLS playlist")
+    parser.add_argument(
+        "--hls-delete-threshold",
+        type=int,
+        default=2,
+        help="extra unreferenced HLS segments kept on disk before deletion",
+    )
+    parser.add_argument(
+        "--hls-segment-type",
+        type=str,
+        default="ts",
+        choices=("ts", "fmp4"),
+        help="HLS segment container type",
+    )
+    parser.add_argument(
+        "--hls-fps",
+        type=float,
+        default=0.0,
+        help="force output FPS for saved video/HLS (0 = auto from source/stream)",
+    )
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
