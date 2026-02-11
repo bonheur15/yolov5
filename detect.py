@@ -280,6 +280,7 @@ def run(
     hls_vcodec="auto",  # ffmpeg encoder for HLS: auto/libx264/h264_nvenc/...
     hls_fps=0.0,  # force output FPS for HLS/video writers (0 = auto)
     rtsp_transport="tcp",  # RTSP transport for capture: tcp/udp/auto
+    person_ellipse=False,  # draw ellipse for detected persons instead of rectangle
 ):
     """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
@@ -459,8 +460,17 @@ def run(
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        color = colors(c, True)
+                        if person_ellipse and c == 0:
+                            x1, y1, x2, y2 = (int(v) for v in xyxy)
+                            cx = max((x1 + x2) // 2, 0)
+                            cy = max((y1 + y2) // 2, 0)
+                            ax = max((x2 - x1) // 2, 1)
+                            ay = max((y2 - y1) // 2, 1)
+                            cv2.ellipse(annotator.im, (cx, cy), (ax, ay), 0, 0, 360, color, line_thickness)
+                        else:
+                            label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
+                            annotator.box_label(xyxy, label, color=color)
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
@@ -650,6 +660,7 @@ def parse_opt():
         choices=("tcp", "udp", "auto"),
         help="RTSP transport for OpenCV capture",
     )
+    parser.add_argument("--person-ellipse", action="store_true", help="draw ellipse for person detections")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
