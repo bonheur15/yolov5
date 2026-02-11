@@ -35,6 +35,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -244,6 +245,49 @@ class FFmpegHLSWriter:
         if self.process.returncode != 0:
             err = self.process.stderr.read().decode(errors="ignore").strip()
             LOGGER.warning(f"HLS writer exited with code {self.process.returncode}: {err}")
+
+
+class RealTimeCFRWriter:
+    """Wall-clock paced wrapper that keeps CFR output from running fast."""
+
+    def __init__(self, writer, fps):
+        self.writer = writer
+        self.fps = max(float(fps), 1.0)
+        self.start = time.monotonic()
+        self.frame_count = 0
+        self.last_frame = None
+
+    def write(self, frame):
+        now = time.monotonic()
+        target_count = int((now - self.start) * self.fps)
+
+        # If ahead of wall clock, wait so output does not run fast.
+        if self.frame_count > target_count:
+            sleep_s = (self.frame_count - target_count) / self.fps
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            now = time.monotonic()
+            target_count = int((now - self.start) * self.fps)
+
+        if self.last_frame is None:
+            self.last_frame = frame
+
+        # If behind wall clock, duplicate previous frame to fill missing time.
+        if target_count > self.frame_count:
+            missing = min(target_count - self.frame_count, int(self.fps * 2))
+            for _ in range(missing):
+                self.writer.write(self.last_frame)
+                self.frame_count += 1
+            # Avoid huge catch-up bursts after long stalls.
+            if target_count - self.frame_count > int(self.fps * 2):
+                self.start = now - (self.frame_count / self.fps)
+
+        self.writer.write(frame)
+        self.frame_count += 1
+        self.last_frame = frame
+
+    def release(self):
+        self.writer.release()
 
 
 @smart_inference_mode()
@@ -515,7 +559,7 @@ def run(
 
                         if save_hls:
                             save_path = str(Path(save_path).with_suffix(".m3u8"))
-                            vid_writer[i] = FFmpegHLSWriter(
+                            hls_writer = FFmpegHLSWriter(
                                 save_path,
                                 width=w,
                                 height=h,
@@ -527,6 +571,7 @@ def run(
                                 hls_vcodec=hls_vcodec,
                                 hls_realtime=hls_realtime,
                             )
+                            vid_writer[i] = RealTimeCFRWriter(hls_writer, fps=fps) if hls_realtime else hls_writer
                         else:
                             save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
                             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
