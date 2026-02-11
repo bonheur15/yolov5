@@ -145,6 +145,7 @@ class FFmpegHLSWriter:
         hls_delete_threshold=2,
         hls_segment_type="ts",
         hls_vcodec="auto",
+        hls_realtime=True,
     ):
         ffmpeg_bin = shutil.which("ffmpeg")
         if ffmpeg_bin is None:
@@ -165,6 +166,10 @@ class FFmpegHLSWriter:
             "-loglevel",
             "error",
             "-y",
+        ]
+        if hls_realtime and ffmpeg_supports_option(ffmpeg_bin, "use_wallclock_as_timestamps"):
+            cmd += ["-use_wallclock_as_timestamps", "1"]
+        cmd += [
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -202,9 +207,9 @@ class FFmpegHLSWriter:
             segment_pattern,
         ]
         if ffmpeg_supports_option(ffmpeg_bin, "fps_mode"):
-            cmd += ["-fps_mode", "cfr"]
+            cmd += ["-fps_mode", "passthrough" if hls_realtime else "cfr"]
         else:
-            cmd += ["-vsync", "cfr"]
+            cmd += ["-vsync", "vfr" if hls_realtime else "cfr"]
         if vcodec == "libx264":
             cmd += ["-preset", "veryfast", "-tune", "zerolatency"]
         elif vcodec == "h264_nvenc":
@@ -278,6 +283,7 @@ def run(
     hls_delete_threshold=2,  # extra stale segments kept on disk before deletion
     hls_segment_type="ts",  # HLS segment type: ts or fmp4
     hls_vcodec="auto",  # ffmpeg encoder for HLS: auto/libx264/h264_nvenc/...
+    hls_realtime=True,  # timestamp HLS output from wall clock to avoid fast/slow playback
     hls_fps=0.0,  # force output FPS for HLS/video writers (0 = auto)
     rtsp_transport="tcp",  # RTSP transport for capture: tcp/udp/auto
     person_ellipse=False,  # draw ellipse for detected persons instead of rectangle
@@ -519,6 +525,7 @@ def run(
                                 hls_delete_threshold=hls_delete_threshold,
                                 hls_segment_type=hls_segment_type,
                                 hls_vcodec=hls_vcodec,
+                                hls_realtime=hls_realtime,
                             )
                         else:
                             save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
@@ -646,6 +653,12 @@ def parse_opt():
         type=str,
         default="auto",
         help="ffmpeg H.264 encoder to use for HLS (auto, libx264, h264_nvenc, ...)",
+    )
+    parser.add_argument(
+        "--hls-realtime",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="timestamp HLS from wall clock (recommended for live RTSP)",
     )
     parser.add_argument(
         "--hls-fps",
