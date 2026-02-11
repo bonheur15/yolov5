@@ -97,6 +97,21 @@ def pick_ffmpeg_h264_encoder(ffmpeg_bin, requested="auto"):
     return "libx264"
 
 
+def ffmpeg_supports_option(ffmpeg_bin, option_name):
+    """Return True if ffmpeg help output contains the given option name."""
+    try:
+        out = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-h", "full"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return f"-{option_name}" in out
+
+
 def resolve_video_fps(vid_cap, dataset, stream_index, vid_stride, fallback=30.0):
     """Resolve output FPS for saved video/HLS, handling stream sources and stride."""
     fps = 0.0
@@ -173,8 +188,6 @@ class FFmpegHLSWriter:
             "0",
             "-flags",
             "+cgop",
-            "-fps_mode",
-            "cfr",
             "-f",
             "hls",
             "-hls_time",
@@ -188,6 +201,10 @@ class FFmpegHLSWriter:
             "-hls_segment_filename",
             segment_pattern,
         ]
+        if ffmpeg_supports_option(ffmpeg_bin, "fps_mode"):
+            cmd += ["-fps_mode", "cfr"]
+        else:
+            cmd += ["-vsync", "cfr"]
         if vcodec == "libx264":
             cmd += ["-preset", "veryfast", "-tune", "zerolatency"]
         elif vcodec == "h264_nvenc":
