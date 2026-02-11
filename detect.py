@@ -68,6 +68,35 @@ from utils.general import (
 from utils.torch_utils import select_device, smart_inference_mode
 
 
+def pick_ffmpeg_h264_encoder(ffmpeg_bin, requested="auto"):
+    """Pick a working H.264 encoder from ffmpeg, or validate a requested one."""
+    if requested != "auto":
+        return requested
+
+    try:
+        encoders = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        # Fall back to the common default; any failure will surface from ffmpeg stderr.
+        return "libx264"
+
+    available = set()
+    for line in encoders.splitlines():
+        if line.startswith(" "):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("V"):
+                available.add(parts[1])
+    for candidate in ("libx264", "h264_nvenc", "libopenh264"):
+        if candidate in available:
+            return candidate
+    return "libx264"
+
+
 def resolve_video_fps(vid_cap, dataset, stream_index, vid_stride, fallback=30.0):
     """Resolve output FPS for saved video/HLS, handling stream sources and stride."""
     fps = 0.0
@@ -100,10 +129,12 @@ class FFmpegHLSWriter:
         hls_list_size=6,
         hls_delete_threshold=2,
         hls_segment_type="ts",
+        hls_vcodec="auto",
     ):
         ffmpeg_bin = shutil.which("ffmpeg")
         if ffmpeg_bin is None:
             raise FileNotFoundError("ffmpeg was not found in PATH; install ffmpeg to use --save-hls")
+        vcodec = pick_ffmpeg_h264_encoder(ffmpeg_bin, requested=hls_vcodec)
 
         playlist_path = Path(playlist_path)
         playlist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,13 +162,9 @@ class FFmpegHLSWriter:
             "-",
             "-an",
             "-c:v",
-            "libx264",
+            vcodec,
             "-pix_fmt",
             "yuv420p",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
             "-g",
             str(gop),
             "-keyint_min",
@@ -161,9 +188,15 @@ class FFmpegHLSWriter:
             "-hls_segment_filename",
             segment_pattern,
         ]
+        if vcodec == "libx264":
+            cmd += ["-preset", "veryfast", "-tune", "zerolatency"]
+        elif vcodec == "h264_nvenc":
+            cmd += ["-preset", "p4", "-tune", "ll"]
         if hls_segment_type == "fmp4":
             cmd += ["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", f"{stem}_init.mp4"]
         cmd += [str(playlist_path)]
+
+        LOGGER.info(f"Using ffmpeg video encoder for HLS: {vcodec}")
 
         self.process = subprocess.Popen(
             cmd,
@@ -176,7 +209,11 @@ class FFmpegHLSWriter:
         if self.process.poll() is not None:
             err = self.process.stderr.read().decode(errors="ignore").strip()
             raise RuntimeError(f"ffmpeg exited before write: {err}")
-        self.process.stdin.write(frame.tobytes())
+        try:
+            self.process.stdin.write(frame.tobytes())
+        except BrokenPipeError as e:
+            err = self.process.stderr.read().decode(errors="ignore").strip()
+            raise RuntimeError(f"ffmpeg broken pipe: {err}") from e
 
     def release(self):
         if self.process.stdin and not self.process.stdin.closed:
@@ -223,7 +260,9 @@ def run(
     hls_list_size=6,  # number of segments kept in playlist
     hls_delete_threshold=2,  # extra stale segments kept on disk before deletion
     hls_segment_type="ts",  # HLS segment type: ts or fmp4
+    hls_vcodec="auto",  # ffmpeg encoder for HLS: auto/libx264/h264_nvenc/...
     hls_fps=0.0,  # force output FPS for HLS/video writers (0 = auto)
+    rtsp_transport="tcp",  # RTSP transport for capture: tcp/udp/auto
 ):
     """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
@@ -282,6 +321,9 @@ def run(
     screenshot = source.lower().startswith("screen")
     if is_url and is_file:
         source = check_file(source)  # download
+    if source.lower().startswith("rtsp://") and rtsp_transport in ("tcp", "udp"):
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{rtsp_transport}"
+        LOGGER.info(f"RTSP transport set to {rtsp_transport} via OPENCV_FFMPEG_CAPTURE_OPTIONS")
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -449,11 +491,18 @@ def run(
                                 hls_list_size=hls_list_size,
                                 hls_delete_threshold=hls_delete_threshold,
                                 hls_segment_type=hls_segment_type,
+                                hls_vcodec=hls_vcodec,
                             )
                         else:
                             save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
                             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-                    vid_writer[i].write(im0)
+                    try:
+                        vid_writer[i].write(im0)
+                    except RuntimeError as e:
+                        LOGGER.warning(f"WARNING ⚠️ HLS writer failed for source {p.name}: {e}")
+                        release_writer(vid_writer[i])
+                        vid_writer[i] = None
+                        vid_path[i] = None
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
@@ -566,10 +615,23 @@ def parse_opt():
         help="HLS segment container type",
     )
     parser.add_argument(
+        "--hls-vcodec",
+        type=str,
+        default="auto",
+        help="ffmpeg H.264 encoder to use for HLS (auto, libx264, h264_nvenc, ...)",
+    )
+    parser.add_argument(
         "--hls-fps",
         type=float,
         default=0.0,
         help="force output FPS for saved video/HLS (0 = auto from source/stream)",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        type=str,
+        default="tcp",
+        choices=("tcp", "udp", "auto"),
+        help="RTSP transport for OpenCV capture",
     )
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
